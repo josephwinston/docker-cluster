@@ -1,14 +1,34 @@
-// Copyright 2013 docker-cluster authors. All rights reserved.
+// Copyright 2014 docker-cluster authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package storage
+package redis
 
 import (
 	"github.com/garyburd/redigo/redis"
+	"github.com/tsuru/docker-cluster/cluster"
+	cstorage "github.com/tsuru/docker-cluster/storage"
+	storageTesting "github.com/tsuru/docker-cluster/storage/testing"
 	"reflect"
 	"testing"
 )
+
+func TestRedisStorage(t *testing.T) {
+	redis := Redis("localhost:6379", "test-docker-cluster")
+	stor := redis.(*redisStorage)
+	conn := stor.pool.Get()
+	defer conn.Close()
+	result, err := conn.Do("KEYS", "test-docker-cluster*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := result.([]interface{})
+	for _, key := range keys {
+		keyName := string(key.([]byte))
+		conn.Do("DEL", keyName)
+	}
+	storageTesting.RunTestsForStorage(redis, t)
+}
 
 func TestRedisStorageStoreContainer(t *testing.T) {
 	conn := fakeConn{}
@@ -148,8 +168,8 @@ func TestRedisStorageRetrieveNoSuchContainer(t *testing.T) {
 	}, 3)
 	container := "affe3022"
 	_, err := storage.RetrieveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v.", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v.", container, cstorage.ErrNoSuchContainer, err)
 	}
 }
 
@@ -224,8 +244,8 @@ func TestRedisRemoveNoSuchContainer(t *testing.T) {
 	}, 3)
 	container := "affe3022"
 	err := storage.RemoveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v.", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v.", container, cstorage.ErrNoSuchContainer, err)
 	}
 }
 
@@ -242,7 +262,7 @@ func TestRedisStorageStoreImage(t *testing.T) {
 		t.Error(err)
 	}
 	cmd := conn.cmds[0]
-	expectedCmd := "SET"
+	expectedCmd := "SADD"
 	if cmd.cmd != expectedCmd {
 		t.Errorf("StoreImage(%q, %q): want command %q. Got %q.", image, host, expectedCmd, cmd.cmd)
 	}
@@ -266,7 +286,7 @@ func TestRedisStorageStoreImagePrefixed(t *testing.T) {
 		t.Error(err)
 	}
 	cmd := conn.cmds[0]
-	expectedCmd := "SET"
+	expectedCmd := "SADD"
 	if cmd.cmd != expectedCmd {
 		t.Errorf("StoreImage(%q, %q): want command %q. Got %q.", image, host, expectedCmd, cmd.cmd)
 	}
@@ -293,23 +313,23 @@ func TestRedisStorageStoreImageFailure(t *testing.T) {
 func TestRedisStorageRetrieveImage(t *testing.T) {
 	conn := resultCommandConn{
 		fakeConn: &fakeConn{},
-		reply:    map[string]interface{}{"GET": []byte("server0")},
+		reply:    map[string]interface{}{"SMEMBERS": []interface{}{[]byte("server0")}},
 	}
 	var storage redisStorage
 	storage.pool = redis.NewPool(func() (redis.Conn, error) {
 		return &conn, nil
 	}, 3)
 	image := "tsuru/python"
-	host, err := storage.RetrieveImage(image)
+	hosts, err := storage.RetrieveImage(image)
 	if err != nil {
 		t.Error(err)
 	}
-	expectedHost := "server0"
-	if host != expectedHost {
-		t.Errorf("RetrieveImage(%q): want host %q. Got %q.", image, expectedHost, host)
+	expectedHosts := []string{"server0"}
+	if !reflect.DeepEqual(hosts, expectedHosts) {
+		t.Errorf("RetrieveImage(%q): want host %q. Got %q.", image, expectedHosts, hosts)
 	}
 	cmd := conn.cmds[0]
-	expectedCmd := "GET"
+	expectedCmd := "SMEMBERS"
 	if cmd.cmd != expectedCmd {
 		t.Errorf("RetrieveImage(%q): want command %q. Got %q.", image, expectedCmd, cmd.cmd)
 	}
@@ -322,7 +342,7 @@ func TestRedisStorageRetrieveImage(t *testing.T) {
 func TestRedisStorageRetrieveImagePrefixed(t *testing.T) {
 	conn := resultCommandConn{
 		fakeConn: &fakeConn{},
-		reply:    map[string]interface{}{"GET": []byte("server0")},
+		reply:    map[string]interface{}{"SMEMBERS": []interface{}{[]byte("server0")}},
 	}
 	var storage redisStorage
 	storage.pool = redis.NewPool(func() (redis.Conn, error) {
@@ -335,7 +355,7 @@ func TestRedisStorageRetrieveImagePrefixed(t *testing.T) {
 		t.Error(err)
 	}
 	cmd := conn.cmds[0]
-	expectedCmd := "GET"
+	expectedCmd := "SMEMBERS"
 	if cmd.cmd != expectedCmd {
 		t.Errorf("RetrieveImage(%q): want command %q. Got %q.", image, expectedCmd, cmd.cmd)
 	}
@@ -348,7 +368,6 @@ func TestRedisStorageRetrieveImagePrefixed(t *testing.T) {
 func TestRedisStorageRetrieveNoSuchImage(t *testing.T) {
 	conn := resultCommandConn{
 		fakeConn: &fakeConn{},
-		reply:    map[string]interface{}{"GET": nil},
 	}
 	var storage redisStorage
 	storage.pool = redis.NewPool(func() (redis.Conn, error) {
@@ -356,8 +375,8 @@ func TestRedisStorageRetrieveNoSuchImage(t *testing.T) {
 	}, 3)
 	image := "tsuru/python"
 	_, err := storage.RetrieveImage(image)
-	if err != ErrNoSuchImage {
-		t.Errorf("RetrieveImage(%q): wrong error. Want %#v. Got %#v.", image, ErrNoSuchImage, err)
+	if err != cstorage.ErrNoSuchImage {
+		t.Errorf("RetrieveImage(%q): wrong error. Want %#v. Got %#v.", image, cstorage.ErrNoSuchImage, err)
 	}
 }
 
@@ -466,12 +485,12 @@ func TestRedisNoAuthentication(t *testing.T) {
 	container := "affe3022"
 	host := "server0"
 	_, err = storage.RetrieveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v", container, cstorage.ErrNoSuchContainer, err)
 	}
 	err = storage.RemoveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v", container, cstorage.ErrNoSuchContainer, err)
 	}
 	err = storage.StoreContainer(container, host)
 	if err != nil {
@@ -510,12 +529,12 @@ func TestRedisStorageAuthentication(t *testing.T) {
 	container := "affe3022"
 	host := "server0"
 	_, err = storage.RetrieveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RetrieveContainer(%q): wrong error. Want %#v. Got %#v", container, cstorage.ErrNoSuchContainer, err)
 	}
 	err = storage.RemoveContainer(container)
-	if err != ErrNoSuchContainer {
-		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v", container, ErrNoSuchContainer, err)
+	if err != cstorage.ErrNoSuchContainer {
+		t.Errorf("RemoveContainer(%q): wrong error. Want %#v. Got %#v", container, cstorage.ErrNoSuchContainer, err)
 	}
 	err = storage.StoreContainer(container, host)
 	if err != nil {
@@ -548,5 +567,117 @@ func TestRedisStorageAuthenticationFailure(t *testing.T) {
 	err = storage.StoreContainer(container, host)
 	if err == nil {
 		t.Error("Got unexpected <nil> error")
+	}
+}
+
+func TestRedisStorageStoreNode(t *testing.T) {
+	conn := resultCommandConn{
+		fakeConn: &fakeConn{},
+		reply: map[string]interface{}{
+			"SISMEMBER": interface{}(int64(0)),
+		},
+	}
+	var storage redisStorage
+	storage.pool = redis.NewPool(func() (redis.Conn, error) {
+		return &conn, nil
+	}, 3)
+	address := "http://docker-node01.com:4243"
+	err := storage.StoreNode(cluster.Node{Address: address})
+	if err != nil {
+		t.Errorf("Got unexpected %s error", err.Error)
+	}
+	cmd := conn.cmds[1]
+	expectedCmd := "SADD"
+	if cmd.cmd != expectedCmd {
+		t.Errorf("StoreNode(%q): want command %q. Got %q.", address, expectedCmd, cmd.cmd)
+	}
+	expectedArgs := []interface{}{"nodes", address}
+	if !reflect.DeepEqual(cmd.args, expectedArgs) {
+		t.Errorf("StoreNode(%q): want args %#v. Got %#v.", address, expectedArgs, cmd.args)
+	}
+}
+
+func TestRedisStorageRetrieveNodes(t *testing.T) {
+	conn := resultCommandConn{
+		fakeConn: &fakeConn{},
+		reply: map[string]interface{}{
+			"SISMEMBER": interface{}(int64(0)),
+			"SMEMBERS":  []interface{}{[]byte("http://docker-node01.com:4243")},
+		},
+	}
+	var storage redisStorage
+	storage.pool = redis.NewPool(func() (redis.Conn, error) {
+		return &conn, nil
+	}, 3)
+	address := "http://docker-node01.com:4243"
+	err := storage.StoreNode(cluster.Node{Address: address})
+	if err != nil {
+		t.Errorf("Got unexpected %s error", err.Error)
+	}
+	nodes, err := storage.RetrieveNodes()
+	if err != nil {
+		t.Errorf("Got unexpected %s error", err.Error)
+	}
+	expected := []cluster.Node{
+		{Address: "http://docker-node01.com:4243", Metadata: map[string]string{}},
+	}
+	if !reflect.DeepEqual(nodes, expected) {
+		t.Errorf("Expected nodes to be equal %q, got %q", expected, nodes)
+	}
+}
+
+func TestRedisStorageRemoveNode(t *testing.T) {
+	conn := resultCommandConn{
+		fakeConn: &fakeConn{},
+		reply:    map[string]interface{}{"SREM": int64(1)},
+	}
+	var storage redisStorage
+	storage.pool = redis.NewPool(func() (redis.Conn, error) {
+		return &conn, nil
+	}, 3)
+	addr := "server01"
+	err := storage.RemoveNode(addr)
+	if err != nil {
+		t.Errorf("Got unexpected %s error", err.Error)
+	}
+	cmd := conn.cmds[0]
+	expectedCmd := "SREM"
+	if cmd.cmd != expectedCmd {
+		t.Errorf("RemoveNode(%q): want command %q. Got %q.", addr, expectedCmd, cmd.cmd)
+	}
+	expectedArgs := []interface{}{"nodes", addr}
+	if !reflect.DeepEqual(cmd.args, expectedArgs) {
+		t.Errorf("RemoveNode(%q): want args %#v. Got %#v.", addr, expectedArgs, cmd.args)
+	}
+}
+
+func TestRedisStorageRemoveNodeFailure(t *testing.T) {
+	var conn failingFakeConn
+	var storage redisStorage
+	storage.pool = redis.NewPool(func() (redis.Conn, error) {
+		return &conn, nil
+	}, 3)
+	err := storage.RemoveNode("server01")
+	if err == nil {
+		t.Error("Unexpected <nil> error")
+	}
+}
+
+func TestRedisStorageRemoveNodeNoSuchNode(t *testing.T) {
+	conn := resultCommandConn{
+		fakeConn: &fakeConn{},
+		reply:    map[string]interface{}{"SREM": int64(0)},
+	}
+	var storage redisStorage
+	storage.pool = redis.NewPool(func() (redis.Conn, error) {
+		return &conn, nil
+	}, 3)
+	addr := "server01"
+	err := storage.RemoveNode(addr)
+	if err == nil {
+		t.Errorf("Got unexpected <nil> error")
+	}
+	if err != cstorage.ErrNoSuchNode {
+		t.Errorf("RemoveNode(%q): wrong error. Want %#v. Got %#v.", addr, cstorage.ErrNoSuchNode, err)
 	}
 }

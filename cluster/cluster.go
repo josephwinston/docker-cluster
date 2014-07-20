@@ -1,4 +1,4 @@
-// Copyright 2013 docker-cluster authors. All rights reserved.
+// Copyright 2014 docker-cluster authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -13,19 +13,12 @@ import (
 	"net/http"
 	"reflect"
 	"sync"
+	"time"
 )
 
 var (
-	// ErrUnknownNode is the error returned when an unknown node is stored in the
-	// storage. This error means some kind of inconsistence between the storage and
-	// the cluster.
-	ErrUnknownNode = errors.New("Unknown node")
-
-	// ErrImmutableCluster is the error returned by Register when the cluster is
-	// immutable, meaning that no new nodes can be registered.
-	ErrImmutableCluster = errors.New("Immutable cluster")
-
-	errStorageDisabled = errors.New("Storage is disabled")
+	errStorageMandatory = errors.New("Storage parameter is mandatory")
+	errHealerInProgress = errors.New("Healer already running")
 )
 
 // ContainerStorage provides methods to store and retrieve information about
@@ -43,20 +36,24 @@ type ContainerStorage interface {
 // images and hosts.
 type ImageStorage interface {
 	StoreImage(image, host string) error
-	RetrieveImage(image string) (host string, err error)
+	RetrieveImage(image string) (host []string, err error)
 	RemoveImage(image string) error
+}
+
+type NodeStorage interface {
+	StoreNode(node Node) error
+	RetrieveNodesByMetadata(metadata map[string]string) ([]Node, error)
+	RetrieveNodes() ([]Node, error)
+	RetrieveNode(address string) (Node, error)
+	UpdateNode(node Node) error
+	RemoveNode(address string) error
+	LockNodeForHealing(address string) (bool, error)
 }
 
 type Storage interface {
 	ContainerStorage
 	ImageStorage
-}
-
-// Node represents a host running Docker. Each node has an ID and an address
-// (in the form <scheme>://<host>:<port>/).
-type Node struct {
-	ID      string
-	Address string
+	NodeStorage
 }
 
 // Cluster is the basic type of the package. It manages internal nodes, and
@@ -64,58 +61,136 @@ type Node struct {
 // which creates a container in one node of the cluster.
 type Cluster struct {
 	scheduler Scheduler
-
-	stor  Storage
-	mutex sync.RWMutex
+	stor      Storage
+	healer    Healer
 }
 
-// New creates a new Cluster, composed by the given nodes.
+// New creates a new Cluster, initially composed by the given nodes.
 //
-// The parameter Scheduler defines the scheduling strategy, and cannot change.
-// It is optional, when set to nil, the cluster will use a round robin strategy
-// defined internaly.
-func New(scheduler Scheduler, nodes ...Node) (*Cluster, error) {
+// The scheduler parameter defines the scheduling strategy. It defaults
+// to round robin if nil.
+// The storage parameter is the storage the cluster instance will use.
+func New(scheduler Scheduler, storage Storage, nodes ...Node) (*Cluster, error) {
 	var (
 		c   Cluster
 		err error
 	)
+	if storage == nil {
+		return nil, errStorageMandatory
+	}
+	c.stor = storage
 	c.scheduler = scheduler
+	c.healer = DefaultHealer{}
 	if scheduler == nil {
 		c.scheduler = &roundRobin{lastUsed: -1}
 	}
 	if len(nodes) > 0 {
-		err = c.Register(nodes...)
+		for _, n := range nodes {
+			err = c.Register(n.Address, n.Metadata)
+			if err != nil {
+				return &c, err
+			}
+		}
 	}
 	return &c, err
 }
 
-// Register adds new nodes to the cluster.
-func (c *Cluster) Register(nodes ...Node) error {
-	if r, ok := c.scheduler.(Registrable); ok {
-		return r.Register(nodes...)
-	}
-	return ErrImmutableCluster
+func (c *Cluster) SetHealer(healer Healer) {
+	c.healer = healer
 }
 
-// SetStorage defines the storage in use the cluster.
-func (c *Cluster) SetStorage(storage Storage) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	c.stor = storage
+// Register adds new nodes to the cluster.
+func (c *Cluster) Register(address string, metadata map[string]string) error {
+	if address == "" {
+		return errors.New("Invalid address")
+	}
+	node := Node{
+		Address:  address,
+		Metadata: metadata,
+	}
+	return c.storage().StoreNode(node)
+}
+
+// Unregister removes nodes from the cluster.
+func (c *Cluster) Unregister(address string) error {
+	return c.storage().RemoveNode(address)
+}
+
+func (c *Cluster) UnfilteredNodes() ([]Node, error) {
+	return c.storage().RetrieveNodes()
+}
+
+func (c *Cluster) Nodes() ([]Node, error) {
+	nodes, err := c.storage().RetrieveNodes()
+	if err != nil {
+		return nil, err
+	}
+	return NodeList(nodes).filterDisabled(), nil
+}
+
+func (c *Cluster) NodesForMetadata(metadata map[string]string) ([]Node, error) {
+	nodes, err := c.storage().RetrieveNodesByMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	return NodeList(nodes).filterDisabled(), nil
+}
+
+func (c *Cluster) handleNodeError(addr string, lastErr error) error {
+	locked, err := c.storage().LockNodeForHealing(addr)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return errHealerInProgress
+	}
+	go func() {
+		node, err := c.storage().RetrieveNode(addr)
+		if err != nil {
+			return
+		}
+		node.Healing = false
+		defer c.storage().UpdateNode(node)
+		node.updateError(lastErr)
+		duration := c.healer.HandleError(node)
+		if duration > 0 {
+			node.updateDisabled(time.Now().Add(duration))
+		}
+	}()
+	return nil
+}
+
+func (c *Cluster) handleNodeSuccess(addr string) error {
+	locked, err := c.storage().LockNodeForHealing(addr)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return errHealerInProgress
+	}
+	node, err := c.storage().RetrieveNode(addr)
+	if err != nil {
+		return err
+	}
+	node.Healing = false
+	defer c.storage().UpdateNode(node)
+	node.updateSuccess()
+	return nil
 }
 
 func (c *Cluster) storage() Storage {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
 	return c.stor
 }
 
 type nodeFunc func(node) (interface{}, error)
 
-func (c *Cluster) runOnNodes(fn nodeFunc, errNotFound error, wait bool) (interface{}, error) {
-	nodes, err := c.scheduler.Nodes()
+func (c *Cluster) runOnNodes(fn nodeFunc, errNotFound error, wait bool, nodeAddresses ...string) (interface{}, error) {
+	nodes, err := c.Nodes()
 	if err != nil {
 		return nil, err
+	}
+	if len(nodeAddresses) > 0 {
+		nodes = c.filterNodes(nodes, nodeAddresses)
 	}
 	var wg sync.WaitGroup
 	finish := make(chan int8, len(nodes))
@@ -134,7 +209,7 @@ func (c *Cluster) runOnNodes(fn nodeFunc, errNotFound error, wait bool) (interfa
 			} else if !reflect.DeepEqual(err, errNotFound) {
 				errChan <- err
 			}
-		}(node{id: n.ID, Client: client})
+		}(node{addr: n.Address, Client: client})
 	}
 	if wait {
 		wg.Wait()
@@ -166,25 +241,29 @@ func (c *Cluster) runOnNodes(fn nodeFunc, errNotFound error, wait bool) (interfa
 	}
 }
 
+func (c *Cluster) filterNodes(nodes []Node, addresses []string) []Node {
+	filteredNodes := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		for _, addr := range addresses {
+			if node.Address == addr {
+				filteredNodes = append(filteredNodes, node)
+				break
+			}
+		}
+	}
+	return filteredNodes
+}
+
 func (c *Cluster) getNode(retrieveFn func(Storage) (string, error)) (node, error) {
 	var n node
 	storage := c.storage()
-	if storage == nil {
-		return n, errStorageDisabled
-	}
-	id, err := retrieveFn(storage)
+	address, err := retrieveFn(storage)
 	if err != nil {
 		return n, err
 	}
-	nodes, err := c.scheduler.Nodes()
+	client, err := docker.NewClient(address)
 	if err != nil {
 		return n, err
 	}
-	for _, nd := range nodes {
-		if nd.ID == id {
-			client, _ := docker.NewClient(nd.Address)
-			return node{id: nd.ID, Client: client, edp: nd.Address}, nil
-		}
-	}
-	return n, ErrUnknownNode
+	return node{addr: address, Client: client}, nil
 }

@@ -1,56 +1,102 @@
-// Copyright 2013 docker-cluster authors. All rights reserved.
+// Copyright 2014 docker-cluster authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package cluster
 
 import (
-	dcli "github.com/fsouza/go-dockerclient"
-	"io"
+	"fmt"
+	"github.com/fsouza/go-dockerclient"
 )
 
-// RemoveImage removes an image from all nodes in the cluster, returning an
+// RemoveImage removes an image from the nodes where this images exists, returning an
 // error in case of failure.
 func (c *Cluster) RemoveImage(name string) error {
-	_, err := c.runOnNodes(func(n node) (interface{}, error) {
-		return nil, n.RemoveImage(name)
-	}, dcli.ErrNoSuchImage, false)
+	hosts, err := c.storage().RetrieveImage(name)
+	if err != nil {
+		return err
+	}
+	_, err = c.runOnNodes(func(n node) (interface{}, error) {
+		err := n.RemoveImage(name)
+		if err != nil {
+			return nil, fmt.Errorf("Error removing image %s from %s: %s", name, n.addr, err.Error())
+		}
+		return nil, nil
+	}, docker.ErrNoSuchImage, false, hosts...)
+	if err != nil {
+		return err
+	}
+	err = c.storage().RemoveImage(name)
 	return err
 }
 
 // PullImage pulls an image from a remote registry server, returning an error
 // in case of failure.
-func (c *Cluster) PullImage(opts dcli.PullImageOptions, w io.Writer) error {
+//
+// It will pull all images in parallel, so users need to make sure that the
+// given buffer is safe.
+func (c *Cluster) PullImage(opts docker.PullImageOptions, auth docker.AuthConfiguration, nodes ...string) error {
 	_, err := c.runOnNodes(func(n node) (interface{}, error) {
-		return nil, n.PullImage(opts, w)
-	}, dcli.ErrNoSuchImage, true)
+		key := opts.Repository
+		c.storage().StoreImage(key, n.addr)
+		return nil, n.PullImage(opts, auth)
+	}, docker.ErrNoSuchImage, true, nodes...)
 	return err
 }
 
 // PushImage pushes an image to a remote registry server, returning an error in
 // case of failure.
-func (c *Cluster) PushImage(opts dcli.PushImageOptions, auth dcli.AuthConfiguration, w io.Writer) error {
-	if node, err := c.getNodeForImage(opts.Name); err == nil {
-		return node.PushImage(opts, auth, w)
-	} else if err != errStorageDisabled {
+func (c *Cluster) PushImage(opts docker.PushImageOptions, auth docker.AuthConfiguration) error {
+	nodes, err := c.getNodesForImage(opts.Name)
+	if err != nil {
 		return err
 	}
-	_, err := c.runOnNodes(func(n node) (interface{}, error) {
-		return nil, n.PushImage(opts, auth, w)
-	}, dcli.ErrNoSuchImage, false)
-	return err
+	for _, node := range nodes {
+		return node.PushImage(opts, auth)
+	}
+	return nil
 }
 
-func (c *Cluster) getNodeForImage(image string) (node, error) {
-	return c.getNode(func(s Storage) (string, error) {
-		return s.RetrieveImage(image)
-	})
+func (c *Cluster) getNodesForImage(image string) ([]node, error) {
+	var nodes []node
+	hosts, err := c.storage().RetrieveImage(image)
+	if err != nil {
+		return nil, err
+	}
+	for _, host := range hosts {
+		node, err := c.getNode(func(s Storage) (string, error) { return host, nil })
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, err
 }
 
 // ImportImage imports an image from a url or stdin
-func (c *Cluster) ImportImage(opts dcli.ImportImageOptions, in io.Reader, out io.Writer) error {
+func (c *Cluster) ImportImage(opts docker.ImportImageOptions) error {
 	_, err := c.runOnNodes(func(n node) (interface{}, error) {
-		return nil, n.ImportImage(opts, in, out)
-	}, dcli.ErrNoSuchImage, false)
+		return nil, n.ImportImage(opts)
+	}, docker.ErrNoSuchImage, false)
 	return err
+}
+
+//BuildImage build an image and push it to register
+func (c *Cluster) BuildImage(buildOptions docker.BuildImageOptions) error {
+	nodes, err := c.Nodes()
+	if err != nil {
+		return err
+	}
+	nodeAddress := nodes[0].Address
+	node, err := c.getNode(func(Storage) (string, error) {
+		return nodeAddress, nil
+	})
+	if err != nil {
+		return err
+	}
+	err = node.BuildImage(buildOptions)
+	if err != nil {
+		return err
+	}
+	return c.storage().StoreImage(buildOptions.Name, nodeAddress)
 }
