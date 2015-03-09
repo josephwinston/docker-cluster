@@ -7,14 +7,18 @@ package cluster
 import (
 	"bytes"
 	"fmt"
-	"github.com/fsouza/go-dockerclient"
-	cstorage "github.com/tsuru/docker-cluster/storage"
-	"github.com/tsuru/tsuru/safe"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/fsouza/go-dockerclient"
+	dtesting "github.com/fsouza/go-dockerclient/testing"
+	cstorage "github.com/tsuru/docker-cluster/storage"
+	"github.com/tsuru/tsuru/safe"
 )
 
 func TestCreateContainer(t *testing.T) {
@@ -36,7 +40,7 @@ func TestCreateContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := docker.Config{Memory: 67108864, Image: "myimg"}
+	config := docker.Config{Memory: 67108864, Image: "myhost/somwhere/myimg"}
 	nodeAddr, container, err := cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
 	if err != nil {
 		t.Fatal(err)
@@ -47,15 +51,15 @@ func TestCreateContainer(t *testing.T) {
 	if container.ID != "e90302" {
 		t.Errorf("CreateContainer: wrong container ID. Want %q. Got %q.", "e90302", container.ID)
 	}
-	imageHosts, err := cluster.storage().RetrieveImage("myimg")
+	img, err := cluster.storage().RetrieveImage("myhost/somwhere/myimg")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(imageHosts) != 1 {
-		t.Fatal("CreateContainer: should store image in host, none found")
+	if img.LastNode != server1.URL {
+		t.Fatalf("CreateContainer: should store image in host, found %s", img.LastNode)
 	}
-	if imageHosts[0] != server1.URL {
-		t.Fatalf("CreateContainer: should store image in host, found %s", imageHosts[0])
+	if len(img.History) != 1 {
+		t.Fatal("CreateContainer: should store image id in host, none found")
 	}
 }
 
@@ -92,6 +96,121 @@ func TestCreateContainerOptions(t *testing.T) {
 	}
 }
 
+func TestCreateContainerErrorImageInRepo(t *testing.T) {
+	server1, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server1.Stop()
+	server1.PrepareFailure("createImgErr", "/images/create")
+	cluster, err := New(nil, &MapStorage{},
+		Node{Address: server1.URL()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := docker.Config{Memory: 67108864, Image: "myserver/user/myimg"}
+	_, _, err = cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
+	if err == nil || strings.Index(err.Error(), "createImgErr") == -1 {
+		t.Fatalf("Expected pull image error, got: %s", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	nodes, err := cluster.UnfilteredNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].FailureCount() != 0 {
+		t.Fatalf("Expected failure count to be 0, got: %d", nodes[0].FailureCount())
+	}
+}
+
+func TestCreateContainerErrorInCreateContainer(t *testing.T) {
+	server1, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server1.Stop()
+	server1.PrepareFailure("createContErr", "/containers/create")
+	cluster, err := New(nil, &MapStorage{},
+		Node{Address: server1.URL()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := docker.Config{Memory: 67108864, Image: "myserver/user/myimg"}
+	_, _, err = cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
+	if err == nil || strings.Index(err.Error(), "createContErr") == -1 {
+		t.Fatalf("Expected create container error, got: %s", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	nodes, err := cluster.UnfilteredNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].FailureCount() != 1 {
+		t.Fatalf("Expected failure count to be 1, got: %d", nodes[0].FailureCount())
+	}
+}
+
+func TestCreateContainerErrorNetError(t *testing.T) {
+	server1, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &MapStorage{},
+		Node{Address: server1.URL()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server1.Stop()
+	config := docker.Config{Memory: 67108864, Image: "myserver/user/myimg"}
+	_, _, err = cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
+	if err == nil || strings.Index(err.Error(), "cannot connect to Docker endpoint") == -1 {
+		t.Fatalf("Expected create container error, got: %s", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	nodes, err := cluster.UnfilteredNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].FailureCount() != 1 {
+		t.Fatalf("Expected failure count to be 1, got: %d", nodes[0].FailureCount())
+	}
+}
+
+func TestCreateContainerWithoutRepo(t *testing.T) {
+	server1, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server1.Stop()
+	cluster, err := New(nil, &MapStorage{},
+		Node{Address: server1.URL()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.PullImage(docker.PullImageOptions{
+		Repository: "user/myimg",
+	}, docker.AuthConfiguration{}, server1.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server1.PrepareFailure("createErr", "/images/create")
+	config := docker.Config{Memory: 67108864, Image: "user/myimg"}
+	nodeAddr, container, err := cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeAddr != server1.URL() {
+		t.Errorf("CreateContainer: wrong node  ID. Want %q. Got %q.", server1.URL(), nodeAddr)
+	}
+	if container.ID == "" {
+		t.Errorf("CreateContainer: wrong container ID. Expected not empty.")
+	}
+}
+
 func TestCreateContainerSchedulerOpts(t *testing.T) {
 	body := `{"Id":"e90302"}`
 	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +224,7 @@ func TestCreateContainerSchedulerOpts(t *testing.T) {
 	}))
 	defer server2.Close()
 	scheduler := optsScheduler{roundRobin{lastUsed: -1}}
-	cluster, err := New(scheduler, &MapStorage{},
+	cluster, err := New(&scheduler, &MapStorage{},
 		Node{Address: server1.URL},
 		Node{Address: server2.URL},
 	)
@@ -143,8 +262,8 @@ func TestCreateContainerFailure(t *testing.T) {
 	}
 	config := docker.Config{Memory: 67108864}
 	_, _, err = cluster.CreateContainer(docker.CreateContainerOptions{Config: &config})
-	expected := "No nodes available"
-	if err == nil || err.Error() != expected {
+	expected := "no such image"
+	if err == nil || strings.Index(err.Error(), expected) == -1 {
 		t.Errorf("Expected error %q, got: %#v", expected, err)
 	}
 }
@@ -174,7 +293,7 @@ func TestCreateContainerSpecifyNode(t *testing.T) {
 	}
 	opts := docker.CreateContainerOptions{Config: &docker.Config{
 		Memory: 67108864,
-		Image:  "myImage",
+		Image:  "some.host/user/myImage",
 	}}
 	nodeAddr, container, err := cluster.CreateContainer(opts, server2.URL)
 	if err != nil {
@@ -190,16 +309,20 @@ func TestCreateContainerSpecifyNode(t *testing.T) {
 	if host != server2.URL {
 		t.Errorf("Cluster.CreateContainer() with storage: wrong data. Want %#v. Got %#v.", server2.URL, host)
 	}
-	if len(requests) != 2 {
-		t.Errorf("Expected 2 api calls, got %d.", len(requests))
+	if len(requests) != 3 {
+		t.Fatalf("Expected 3 api calls, got %d.", len(requests))
 	}
-	expectedReq := "/images/create?fromImage=myImage"
+	expectedReq := "/images/create?fromImage=some.host%2Fuser%2FmyImage"
 	if requests[0] != expectedReq {
 		t.Errorf("Incorrect request 0. Want %#v. Got %#v", expectedReq, requests[0])
 	}
-	expectedReq = "/containers/create"
+	expectedReq = "/images/some.host/user/myImage/json"
 	if requests[1] != expectedReq {
 		t.Errorf("Incorrect request 1. Want %#v. Got %#v", expectedReq, requests[1])
+	}
+	expectedReq = "/containers/create"
+	if requests[2] != expectedReq {
+		t.Errorf("Incorrect request 2. Want %#v. Got %#v", expectedReq, requests[2])
 	}
 }
 
@@ -688,6 +811,70 @@ func TestRemoveContainerNotFoundWithStorage(t *testing.T) {
 	expected := cstorage.ErrNoSuchContainer
 	if !reflect.DeepEqual(err, expected) {
 		t.Errorf("RemoveContainer(%q): Wrong error. Want %#v. Got %#v.", id, expected, err)
+	}
+}
+
+func TestRemoveContainerNotFoundInServer(t *testing.T) {
+	var called bool
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "No such container", http.StatusNotFound)
+	}))
+	defer server1.Close()
+	id := "abc123"
+	storage := MapStorage{}
+	err := storage.StoreContainer(id, server1.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &storage,
+		Node{Address: server1.URL},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.RemoveContainer(docker.RemoveContainerOptions{ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Errorf("RemoveContainer(%q): Did not call node HTTP server", id)
+	}
+	_, err = storage.RetrieveContainer(id)
+	if err == nil {
+		t.Errorf("RemoveContainer(%q): should remove the container from the storage", id)
+	}
+}
+
+func TestRemoveContainerServerError(t *testing.T) {
+	var called bool
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "Random server error", http.StatusInternalServerError)
+	}))
+	defer server1.Close()
+	id := "abc123"
+	storage := MapStorage{}
+	err := storage.StoreContainer(id, server1.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &storage,
+		Node{Address: server1.URL},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.RemoveContainer(docker.RemoveContainerOptions{ID: id})
+	if err == nil {
+		t.Errorf("RemoveContainer(%q): should not remove the container from the storage", id)
+	}
+	if !called {
+		t.Errorf("RemoveContainer(%q): Did not call node HTTP server", id)
+	}
+	addr, err := storage.RetrieveContainer(id)
+	if err != nil || addr != server1.URL {
+		t.Errorf("RemoveContainer(%q): should not remove the container from the storage", id)
 	}
 }
 
@@ -1507,9 +1694,9 @@ func TestCommitContainerWithStorage(t *testing.T) {
 	if called {
 		t.Errorf("CommitContainer(%q): should not call the all node servers.", id)
 	}
-	nodes, _ := storage.RetrieveImage("tsuru/python")
-	if !reflect.DeepEqual(nodes, []string{server2.URL}) {
-		t.Errorf("CommitContainer(%q): wrong image ID in the storage. Want %q. Got %q", id, []string{server2.URL}, nodes)
+	img, _ := storage.RetrieveImage("tsuru/python")
+	if img.LastNode != server2.URL {
+		t.Errorf("CommitContainer(%q): wrong image last node in the storage. Want %q. Got %q", id, server2.URL, img.LastNode)
 	}
 }
 
@@ -1519,12 +1706,12 @@ func TestCommitContainerWithStorageAndImageID(t *testing.T) {
 	}))
 	defer server.Close()
 	id := "abc123"
-	storage := MapStorage{}
-	err := storage.StoreContainer(id, server.URL)
+	stor := MapStorage{}
+	err := stor.StoreContainer(id, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cluster, err := New(nil, &storage, Node{Address: server.URL})
+	cluster, err := New(nil, &stor, Node{Address: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1533,9 +1720,9 @@ func TestCommitContainerWithStorageAndImageID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodes, _ := storage.RetrieveImage(image.ID)
-	if !reflect.DeepEqual(nodes, []string{server.URL}) {
-		t.Errorf("CommitContainer(%q): wrong image ID in the storage. Want %q. Got %q", id, []string{server.URL}, nodes)
+	_, err = stor.RetrieveImage(image.ID)
+	if err != cstorage.ErrNoSuchImage {
+		t.Errorf("CommitContainer(%q): Expected no such image error, got: %s", id, err)
 	}
 }
 
@@ -1550,6 +1737,75 @@ func TestCommitContainerNotFoundWithStorage(t *testing.T) {
 	expected := cstorage.ErrNoSuchContainer
 	if !reflect.DeepEqual(err, expected) {
 		t.Errorf("CommitContainer(%q): wrong error. Want %#v. Got %#v.", id, expected, err)
+	}
+}
+
+func TestCommitContainerTagShouldIgnoreRemoveImageErrors(t *testing.T) {
+	imgTag := "mytag/mytag"
+	expectedImageId := "596069db4bf5"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(fmt.Sprintf(`{"Id":"%s"}`, expectedImageId)))
+	}))
+	defer server.Close()
+	containerId := "abc123"
+	storage := MapStorage{}
+	err := storage.StoreContainer(containerId, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = storage.StoreImage(imgTag, "id1", "http://invalid.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &storage, Node{Address: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := docker.CommitContainerOptions{Container: containerId, Repository: imgTag}
+	image, err := cluster.CommitContainer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.ID != expectedImageId {
+		t.Fatalf("Expected image id to be %q, got: %q", expectedImageId, image.ID)
+	}
+	img, _ := storage.RetrieveImage(imgTag)
+	if img.LastNode != server.URL {
+		t.Errorf("CommitContainer(%q): wrong image last node in the storage. Want %q. Got %q", containerId, server.URL, img.LastNode)
+	}
+}
+
+func TestCommitContainerWithRepositoryAndTag(t *testing.T) {
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Id":"596069db4bf5"}`))
+	}))
+	defer server1.Close()
+	id := "abc123"
+	storage := MapStorage{}
+	err := storage.StoreContainer(id, server1.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &storage,
+		Node{Address: server1.URL},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := docker.CommitContainerOptions{Container: id, Repository: "tsuru/python", Tag: "v1"}
+	image, err := cluster.CommitContainer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.ID != "596069db4bf5" {
+		t.Errorf("CommitContainer: the image container is %s, expected: '596069db4bf5'", image.ID)
+	}
+	img, err := storage.RetrieveImage("tsuru/python:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.LastNode != server1.URL {
+		t.Errorf("CommitContainer(%q): wrong image last node in the storage. Want %q. Got %q", id, server1.URL, img.LastNode)
 	}
 }
 
@@ -1592,7 +1848,7 @@ func TestExportContainerNotFoundWithStorage(t *testing.T) {
 	out := &bytes.Buffer{}
 	err = cluster.ExportContainer(docker.ExportContainerOptions{ID: containerID, OutputStream: out})
 	if err == nil {
-		t.Errorf("ExportContainer: expected error not to be <nil>", err.Error())
+		t.Error("ExportContainer: expected error not to be <nil>")
 	}
 }
 
@@ -1610,7 +1866,7 @@ func TestExportContainerNoStorage(t *testing.T) {
 	out := &bytes.Buffer{}
 	err = cluster.ExportContainer(docker.ExportContainerOptions{ID: containerID, OutputStream: out})
 	if err == nil {
-		t.Errorf("ExportContainer: expected error not to be <nil>", err.Error())
+		t.Error("ExportContainer: expected error not to be <nil>")
 	}
 }
 
@@ -1655,5 +1911,138 @@ func TestGetNode(t *testing.T) {
 	expectedMsg := "storage error"
 	if err.Error() != expectedMsg {
 		t.Errorf("cluster.getNode(%q): wrong error. Want %q. Got %q.", "e90301", expectedMsg, err.Error())
+	}
+}
+
+func TestTopContainer(t *testing.T) {
+	server1, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server2, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &MapStorage{},
+		Node{Address: server1.URL()},
+		Node{Address: server2.URL()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := docker.Config{Memory: 1000, Image: "myhost/somwhere/myimg"}
+	config.Cmd = []string{"tail", "-f"}
+	opts := docker.CreateContainerOptions{Config: &config}
+	_, container, err := cluster.CreateContainer(opts, server1.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.StartContainer(container.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := cluster.TopContainer(container.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Processes) != 1 {
+		t.Fatalf("TopContainer: Unexpected process len, got: %d", len(result.Processes))
+	}
+	if result.Processes[0][len(result.Processes[0])-1] != "tail -f" {
+		t.Fatalf("TopContainer: Unexpected command name, got: %s", result.Processes[0][len(result.Processes[0])-1])
+	}
+}
+
+func TestExecContainer(t *testing.T) {
+	server, err := dtesting.NewServer("127.0.0.1:0", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &MapStorage{}, Node{Address: server.URL()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := docker.Config{Memory: 1000, Image: "myhost/somwhere/myimg"}
+	config.Cmd = []string{"tail", "-f"}
+	opts := docker.CreateContainerOptions{Config: &config}
+	_, container, err := cluster.CreateContainer(opts, server.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.StartContainer(container.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createExecOpts := docker.CreateExecOptions{
+		AttachStdin:  false,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+		Cmd:          []string{"ls"},
+		Container:    container.ID,
+	}
+	exec, err := cluster.CreateExec(createExecOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec == nil {
+		t.Fatal("CreateExec: Exec was not created!")
+	}
+	startExecOptions := docker.StartExecOptions{
+		OutputStream: nil,
+		ErrorStream:  nil,
+		RawTerminal:  true,
+	}
+	err = cluster.StartExec(exec.ID, container.ID, startExecOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cluster.ResizeExecTTY(exec.ID, container.ID, 10, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInspectExec(t *testing.T) {
+	body := `{"ID":"d34db33f","Running":false,"ExitCode":1}`
+	var count int
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+	}))
+	defer server1.Close()
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	}))
+	defer server2.Close()
+	contId := "e90302"
+	storage := MapStorage{}
+	err := storage.StoreContainer(contId, server2.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := New(nil, &storage,
+		Node{Address: server1.URL},
+		Node{Address: server2.URL},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execId := "d34db33f"
+	exec, err := cluster.InspectExec(execId, contId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec.ID != execId {
+		t.Errorf("InspectExec: Wrong ID. Want %q. Got %q.", execId, exec.ID)
+	}
+	if exec.Running {
+		t.Errorf("InspectExec: Wrong Running. Want false. Got true.")
+	}
+	if exec.ExitCode != 1 {
+		t.Errorf("InspectExec: Wrong Running. Want %d. Got %d.", 1, exec.ExitCode)
+	}
+	if count > 0 {
+		t.Errorf("InspectExec: should not send request to all servers, but did.")
 	}
 }

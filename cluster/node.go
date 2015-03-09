@@ -1,4 +1,4 @@
-// Copyright 2014 docker-cluster authors. All rights reserved.
+// Copyright 2015 docker-cluster authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"time"
+
+	"github.com/fsouza/go-dockerclient"
 )
 
 // Node represents a host running Docker. Each node has an Address
@@ -18,8 +20,13 @@ import (
 // metadata.
 type Node struct {
 	Address  string `bson:"_id"`
+	Healing  HealingData
 	Metadata map[string]string
-	Healing  bool
+}
+
+type HealingData struct {
+	LockedUntil time.Time
+	IsFailure   bool
 }
 
 type NodeList []Node
@@ -44,8 +51,13 @@ func (n Node) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (n *Node) HasSuccess() bool {
+	_, hasSuccess := n.Metadata["LastSuccess"]
+	return hasSuccess
+}
+
 func (n *Node) Status() string {
-	if n.Healing {
+	if n.isHealing() {
 		return NodeStatusHealing
 	}
 	if n.Metadata == nil {
@@ -56,8 +68,7 @@ func (n *Node) Status() string {
 		if hasFailures {
 			return NodeStatusRetry
 		}
-		_, hasSuccess := n.Metadata["LastSuccess"]
-		if !hasSuccess {
+		if !n.HasSuccess() {
 			return NodeStatusWaiting
 		}
 		return NodeStatusReady
@@ -74,11 +85,26 @@ func (n *Node) FailureCount() int {
 	return failures
 }
 
-func (n *Node) updateError(lastErr error) {
+func (n *Node) ResetFailures() {
 	if n.Metadata == nil {
 		n.Metadata = make(map[string]string)
 	}
-	n.Metadata["Failures"] = strconv.Itoa(n.FailureCount() + 1)
+	delete(n.Metadata, "Failures")
+	delete(n.Metadata, "DisabledUntil")
+	delete(n.Metadata, "LastError")
+}
+
+func (n *Node) Client() (*docker.Client, error) {
+	return docker.NewClient(n.Address)
+}
+
+func (n *Node) updateError(lastErr error, incrementFailures bool) {
+	if n.Metadata == nil {
+		n.Metadata = make(map[string]string)
+	}
+	if incrementFailures {
+		n.Metadata["Failures"] = strconv.Itoa(n.FailureCount() + 1)
+	}
 	n.Metadata["LastError"] = lastErr.Error()
 }
 
@@ -90,17 +116,24 @@ func (n *Node) updateDisabled(disabledUntil time.Time) {
 }
 
 func (n *Node) updateSuccess() {
-	if n.Metadata == nil {
-		n.Metadata = make(map[string]string)
-	}
-	delete(n.Metadata, "Failures")
-	delete(n.Metadata, "DisabledUntil")
-	delete(n.Metadata, "LastError")
+	n.ResetFailures()
 	n.Metadata["LastSuccess"] = time.Now().Format(time.RFC3339)
 }
 
+func (n *Node) CleanMetadata() map[string]string {
+	paramsCopy := make(map[string]string)
+	for k, v := range n.Metadata {
+		paramsCopy[k] = v
+	}
+	delete(paramsCopy, "Failures")
+	delete(paramsCopy, "DisabledUntil")
+	delete(paramsCopy, "LastError")
+	delete(paramsCopy, "LastSuccess")
+	return paramsCopy
+}
+
 func (n *Node) isEnabled() bool {
-	if n.Healing {
+	if n.isHealing() {
 		return false
 	}
 	if n.Metadata == nil {
@@ -109,6 +142,10 @@ func (n *Node) isEnabled() bool {
 	disabledStr, _ := n.Metadata["DisabledUntil"]
 	t, _ := time.Parse(time.RFC3339, disabledStr)
 	return time.Now().After(t)
+}
+
+func (n *Node) isHealing() bool {
+	return (!n.Healing.LockedUntil.IsZero()) && n.Healing.IsFailure
 }
 
 func (nodes NodeList) filterDisabled() NodeList {

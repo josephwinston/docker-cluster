@@ -5,10 +5,12 @@
 package mongodb
 
 import (
+	"time"
+
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/docker-cluster/storage"
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
 type mongodbStorage struct {
@@ -45,33 +47,56 @@ func (s *mongodbStorage) RemoveContainer(container string) error {
 	return coll.Remove(bson.M{"_id": container})
 }
 
-func (s *mongodbStorage) StoreImage(image, host string) error {
-	coll := s.getColl("images")
+func (s *mongodbStorage) RetrieveContainers() ([]cluster.Container, error) {
+	coll := s.getColl("containers")
 	defer coll.Database.Session.Close()
-	_, err := coll.UpsertId(image, bson.M{"$addToSet": bson.M{"hosts": host}})
+	var containers []cluster.Container
+	err := coll.Find(nil).All(&containers)
+	return containers, err
+}
+
+func (s *mongodbStorage) StoreImage(repo, id, host string) error {
+	coll := s.getColl("images_history")
+	defer coll.Database.Session.Close()
+	_, err := coll.UpsertId(repo, bson.M{
+		"$addToSet": bson.M{"history": bson.D([]bson.DocElem{
+			// Order is important for $addToSet!
+			bson.DocElem{Name: "node", Value: host}, bson.DocElem{Name: "imageid", Value: id},
+		})},
+		"$set": bson.M{"lastnode": host, "lastid": id},
+	})
 	return err
 }
 
-func (s *mongodbStorage) RetrieveImage(image string) ([]string, error) {
-	coll := s.getColl("images")
+func (s *mongodbStorage) RetrieveImage(repo string) (cluster.Image, error) {
+	coll := s.getColl("images_history")
 	defer coll.Database.Session.Close()
-	dbImage := struct {
-		Hosts []string
-	}{}
-	err := coll.Find(bson.M{"_id": image}).One(&dbImage)
+	var image cluster.Image
+	err := coll.FindId(repo).One(&image)
 	if err != nil {
 		if err == mgo.ErrNotFound {
-			return nil, storage.ErrNoSuchImage
+			return image, storage.ErrNoSuchImage
 		}
-		return nil, err
+		return image, err
 	}
-	return dbImage.Hosts, nil
+	if len(image.History) == 0 {
+		return image, storage.ErrNoSuchImage
+	}
+	return image, nil
 }
 
-func (s *mongodbStorage) RemoveImage(image string) error {
-	coll := s.getColl("images")
+func (s *mongodbStorage) RemoveImage(repo, id, host string) error {
+	coll := s.getColl("images_history")
 	defer coll.Database.Session.Close()
-	return coll.Remove(bson.M{"_id": image})
+	return coll.UpdateId(repo, bson.M{"$pull": bson.M{"history": bson.M{"node": host, "imageid": id}}})
+}
+
+func (s *mongodbStorage) RetrieveImages() ([]cluster.Image, error) {
+	coll := s.getColl("images_history")
+	defer coll.Database.Session.Close()
+	var images []cluster.Image
+	err := coll.Find(nil).All(&images)
+	return images, err
 }
 
 func (s *mongodbStorage) StoreNode(node cluster.Node) error {
@@ -84,17 +109,48 @@ func (s *mongodbStorage) StoreNode(node cluster.Node) error {
 	return err
 }
 
-func (s *mongodbStorage) LockNodeForHealing(address string) (bool, error) {
+func (s *mongodbStorage) LockNodeForHealing(address string, isFailure bool, timeout time.Duration) (bool, error) {
 	coll := s.getColl("nodes")
 	defer coll.Database.Session.Close()
+	now := time.Now().UTC()
+	until := now.Add(timeout)
+	setOperation := bson.M{"$set": bson.M{"healing": bson.M{"lockeduntil": until, "isfailure": isFailure}}}
 	err := coll.Update(
-		bson.M{"_id": address, "healing": bson.M{"$in": []interface{}{false, nil}}},
-		bson.M{"$set": bson.M{"healing": true}},
-	)
+		bson.M{"_id": address, "healing.lockeduntil": nil},
+		setOperation)
 	if err == mgo.ErrNotFound {
-		return false, nil
+		var dbNode cluster.Node
+		err = coll.Find(bson.M{"_id": address}).One(&dbNode)
+		if dbNode.Healing.LockedUntil.After(now) {
+			return false, nil
+		}
+		err = coll.Update(bson.M{
+			"_id": address,
+			"healing.lockeduntil": dbNode.Healing.LockedUntil,
+		}, setOperation)
+		if err == mgo.ErrNotFound {
+			return false, nil
+		}
 	}
 	return err == nil, err
+}
+
+func (s *mongodbStorage) ExtendNodeLock(address string, timeout time.Duration) error {
+	coll := s.getColl("nodes")
+	defer coll.Database.Session.Close()
+	now := time.Now().UTC()
+	until := now.Add(timeout)
+	return coll.Update(
+		bson.M{"_id": address},
+		bson.M{"$set": bson.M{"healing.lockeduntil": until}})
+}
+
+func (s *mongodbStorage) UnlockNode(address string) error {
+	coll := s.getColl("nodes")
+	defer coll.Database.Session.Close()
+	return coll.Update(
+		bson.M{"_id": address},
+		bson.M{"$set": bson.M{"healing": nil}})
 }
 
 func (s *mongodbStorage) RetrieveNodesByMetadata(metadata map[string]string) ([]cluster.Node, error) {

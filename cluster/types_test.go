@@ -7,6 +7,8 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/fsouza/go-dockerclient"
 )
 
@@ -35,14 +37,20 @@ func (failingStorage) RetrieveContainer(container string) (string, error) {
 func (failingStorage) RemoveContainer(container string) error {
 	return errors.New("storage error")
 }
-func (failingStorage) StoreImage(image, host string) error {
-	return errors.New("storage error")
-}
-func (failingStorage) RetrieveImage(image string) ([]string, error) {
+func (failingStorage) RetrieveContainers() ([]Container, error) {
 	return nil, errors.New("storage error")
 }
-func (failingStorage) RemoveImage(image string) error {
+func (failingStorage) StoreImage(repository, id, host string) error {
 	return errors.New("storage error")
+}
+func (failingStorage) RetrieveImage(repository string) (Image, error) {
+	return Image{}, errors.New("storage error")
+}
+func (failingStorage) RemoveImage(repository, id, host string) error {
+	return errors.New("storage error")
+}
+func (failingStorage) RetrieveImages() ([]Image, error) {
+	return nil, errors.New("storage error")
 }
 func (failingStorage) StoreNode(node Node) error {
 	return errors.New("storage error")
@@ -62,8 +70,14 @@ func (failingStorage) UpdateNode(node Node) error {
 func (failingStorage) RemoveNode(address string) error {
 	return errors.New("storage error")
 }
-func (failingStorage) LockNodeForHealing(address string) (bool, error) {
+func (failingStorage) LockNodeForHealing(address string, isFailure bool, timeout time.Duration) (bool, error) {
 	return false, errors.New("storage error")
+}
+func (failingStorage) ExtendNodeLock(address string, timeout time.Duration) error {
+	return errors.New("storage error")
+}
+func (failingStorage) UnlockNode(address string) error {
+	return errors.New("storage error")
 }
 
 type fakeScheduler struct{}
@@ -82,7 +96,7 @@ type optsScheduler struct {
 	roundRobin
 }
 
-func (s optsScheduler) Schedule(c *Cluster, opts docker.CreateContainerOptions, schedulerOpts SchedulerOptions) (Node, error) {
+func (s *optsScheduler) Schedule(c *Cluster, opts docker.CreateContainerOptions, schedulerOpts SchedulerOptions) (Node, error) {
 	optStr := schedulerOpts.(string)
 	if optStr != "myOpt" {
 		return Node{}, fmt.Errorf("Invalid option %s", optStr)

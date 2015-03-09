@@ -1,13 +1,13 @@
 language: go
 go:
-  - 1.1.2
-  - 1.2
+  - 1.4
   - tip
 install:
-  - go get -d ./...
-  - go get github.com/tsuru/tsuru/safe
+  - go get -d -t ./...
+  - go get golang.org/x/tools/cmd/vet
 script:
   - go test -race ./...
+  - go vet ./...
 services:
   - redis-server
   - mongodb

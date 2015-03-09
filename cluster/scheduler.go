@@ -6,8 +6,10 @@ package cluster
 
 import (
 	"errors"
-	"github.com/fsouza/go-dockerclient"
 	"sync"
+	"sync/atomic"
+
+	"github.com/fsouza/go-dockerclient"
 )
 
 // Arbitrary options to be sent to the scheduler. This options will
@@ -22,29 +24,20 @@ type Scheduler interface {
 	Schedule(c *Cluster, opts docker.CreateContainerOptions, schedulerOpts SchedulerOptions) (Node, error)
 }
 
-type node struct {
-	*docker.Client
-	addr string
-}
-
 type roundRobin struct {
 	lastUsed int64
-	mut      sync.RWMutex
-	init     bool
+	once     sync.Once
 }
 
 func (s *roundRobin) Schedule(c *Cluster, opts docker.CreateContainerOptions, schedulerOpts SchedulerOptions) (Node, error) {
-	s.mut.RLock()
-	defer s.mut.RUnlock()
 	nodes, _ := c.Nodes()
 	if len(nodes) == 0 {
 		return Node{}, errors.New("No nodes available")
 	}
-	if !s.init {
-		s.init = true
+	s.once.Do(func() {
 		s.lastUsed = -1
-	}
-	s.lastUsed += int64(1)
-	index := s.lastUsed % int64(len(nodes))
+	})
+	value := atomic.AddInt64(&s.lastUsed, 1)
+	index := value % int64(len(nodes))
 	return nodes[index], nil
 }
